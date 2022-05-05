@@ -154,17 +154,6 @@ class ESPnetDiarizationModel(AbsESPnetModel):
 
         if self.attractor is None:
             loss_pit, loss_att = None, None
-
-
-                        #breakpoint()
-            #breakpoint()
-            
-                #change_points = self.get_change_points(spk_labels)
-                #spk_labels = omit change_pts
-                #pred = ....
-                #encoder_out_lens = ...
-
-
             loss, perm_idx, perm_list, label_perm = self.pit_loss(
                 pred, spk_labels, encoder_out_lens, collar_mask.unsqueeze(-1)
             )
@@ -296,7 +285,6 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         change_pts = []
         for i in range(spk_labels.shape[0]):
             change_pts.append(list(np.where(np.diff(spk_labels[i], axis=0))[0]))
-            #breakpoint()
 
         return change_pts
 
@@ -305,11 +293,9 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         mask = self.create_length_mask(length, label.size(1), label.size(2))
         loss = bce_loss(pred, label)
         loss = loss * mask
-        #breakpoint()
         loss = loss * collar_mask
         loss = torch.sum(torch.mean(loss, dim=2), dim=1)
         loss = torch.unsqueeze(loss, dim=1)
-        #breakpoint()
         return loss
 
     def pit_loss(self, pred, label, lengths, collar_mask):
