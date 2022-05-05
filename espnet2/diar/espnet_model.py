@@ -9,6 +9,7 @@ from typing import Optional
 from typing import Tuple
 
 import numpy as np
+from tensorboard import notebook
 import torch
 from typeguard import check_argument_types
 
@@ -21,6 +22,9 @@ from espnet2.diar.decoder.abs_decoder import AbsDecoder
 from espnet2.layers.abs_normalize import AbsNormalize
 from espnet2.torch_utils.device_funcs import force_gatherable
 from espnet2.train.abs_espnet_model import AbsESPnetModel
+
+from pyannote.core import Annotation, Segment, notebook
+from pyannote.metrics.diarization import DiarizationErrorRate
 
 if LooseVersion(torch.__version__) >= LooseVersion("1.6.0"):
     from torch.cuda.amp import autocast
@@ -51,6 +55,7 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         decoder: AbsDecoder,
         attractor: Optional[AbsAttractor],
         attractor_weight: float = 1.0,
+        collar: torch.int = 3
     ):
         assert check_argument_types()
 
@@ -64,6 +69,7 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         self.attractor_weight = attractor_weight
         self.attractor = attractor
         self.decoder = decoder
+        self.collar = collar
 
         if self.attractor is not None:
             self.decoder = None
@@ -105,7 +111,7 @@ class ESPnetDiarizationModel(AbsESPnetModel):
             encoder_out_shuffled = encoder_out.clone()
             for i in range(len(encoder_out_lens)):
                 encoder_out_shuffled[i, : encoder_out_lens[i], :] = encoder_out[
-                    i, torch.randperm(encoder_out_lens[i]), :
+                    i, torch.randperm(encoder_out_lens[i]), :   
                 ]
             attractor, att_prob = self.attractor(
                 encoder_out_shuffled,
@@ -120,6 +126,7 @@ class ESPnetDiarizationModel(AbsESPnetModel):
             # Remove the final attractor which does not correspond to a speaker
             # Then multiply the attractors and encoder_out
             pred = torch.bmm(encoder_out, attractor[:, :-1, :].permute(0, 2, 1))
+
         # 3. Aggregate time-domain labels
         spk_labels, spk_labels_lengths = self.label_aggregator(
             spk_labels, spk_labels_lengths
@@ -133,14 +140,37 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         if length_diff > 0 and length_diff <= length_diff_tolerance:
             spk_labels = spk_labels[:, 0 : pred.shape[1], :]
 
+
+        collar_mask = torch.ones_like(spk_labels[:,:,0])
+
+        if self.collar > 0:
+            change_pts = self.get_change_points(spk_labels)
+            
+            for i in range(batch_size):
+                for change_pt in change_pts[i]:
+                    start = max(0, change_pt - self.collar+1)
+                    end = min(spk_labels.shape[1], change_pt + self.collar+1)
+                    collar_mask[i,start:end] = 0.0
+
         if self.attractor is None:
             loss_pit, loss_att = None, None
+
+
+                        #breakpoint()
+            #breakpoint()
+            
+                #change_points = self.get_change_points(spk_labels)
+                #spk_labels = omit change_pts
+                #pred = ....
+                #encoder_out_lens = ...
+
+
             loss, perm_idx, perm_list, label_perm = self.pit_loss(
-                pred, spk_labels, encoder_out_lens
+                pred, spk_labels, encoder_out_lens, collar_mask.unsqueeze(-1)
             )
         else:
             loss_pit, perm_idx, perm_list, label_perm = self.pit_loss(
-                pred, spk_labels, encoder_out_lens
+                pred, spk_labels, encoder_out_lens, collar_mask.unsqueeze(-1)
             )
             loss_att = self.attractor_loss(att_prob, spk_labels)
             loss = loss_pit + self.attractor_weight * loss_att
@@ -155,6 +185,8 @@ class ESPnetDiarizationModel(AbsESPnetModel):
             speaker_falarm,
             speaker_error,
         ) = self.calc_diarization_error(pred, label_perm, encoder_out_lens)
+
+        collar_der = self.calc_collar_der(pred, label_perm, encoder_out_lens, self.collar)
 
         if speech_scored > 0 and num_frames > 0:
             sad_mr, sad_fr, mi, fa, cf, acc, der = (
@@ -180,6 +212,7 @@ class ESPnetDiarizationModel(AbsESPnetModel):
             cf=cf,
             acc=acc,
             der=der,
+            collar_der=collar_der,
         )
 
         loss, stats, weight = force_gatherable((loss, stats, batch_size), loss.device)
@@ -258,23 +291,35 @@ class ESPnetDiarizationModel(AbsESPnetModel):
             feats, feats_lengths = speech, speech_lengths
         return feats, feats_lengths
 
-    def pit_loss_single_permute(self, pred, label, length):
+    def get_change_points(self, spk_labels):
+        spk_labels = spk_labels.cpu()
+        change_pts = []
+        for i in range(spk_labels.shape[0]):
+            change_pts.append(list(np.where(np.diff(spk_labels[i], axis=0))[0]))
+            #breakpoint()
+
+        return change_pts
+
+    def pit_loss_single_permute(self, pred, label, length, collar_mask):
         bce_loss = torch.nn.BCEWithLogitsLoss(reduction="none")
         mask = self.create_length_mask(length, label.size(1), label.size(2))
         loss = bce_loss(pred, label)
         loss = loss * mask
+        #breakpoint()
+        loss = loss * collar_mask
         loss = torch.sum(torch.mean(loss, dim=2), dim=1)
         loss = torch.unsqueeze(loss, dim=1)
+        #breakpoint()
         return loss
 
-    def pit_loss(self, pred, label, lengths):
+    def pit_loss(self, pred, label, lengths, collar_mask):
         # Note (jiatong): Credit to https://github.com/hitachi-speech/EEND
         num_output = label.size(2)
         permute_list = [np.array(p) for p in permutations(range(num_output))]
         loss_list = []
         for p in permute_list:
             label_perm = label[:, :, p]
-            loss_perm = self.pit_loss_single_permute(pred, label_perm, lengths)
+            loss_perm = self.pit_loss_single_permute(pred, label_perm, lengths, collar_mask)
             loss_list.append(loss_perm)
         loss = torch.cat(loss_list, dim=1)
         min_loss, min_idx = torch.min(loss, dim=1)
@@ -306,9 +351,44 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         return loss
 
     @staticmethod
+    def consecutive(data, stepsize=1):
+        return np.split(data, np.where(np.diff(data) != stepsize)[0]+1)
+
+    def get_segments(self, vector):
+        segments = []
+        consecutives = self.consecutive(np.where(vector==1)[0])
+        for cons in consecutives:
+            if len(cons) != 0:
+                segment = Segment(float(cons[0]), float(cons[-1]+1))
+                segments.append(segment)
+        return segments
+
+    def calc_collar_der(self, pred, label, length, collar):
+        collar_der = 0
+        (batch_size, max_len, num_output) = label.size()
+
+        label_np = label.data.cpu().numpy().astype(int)
+        pred_np = (pred.data.cpu().numpy() > 0).astype(int)
+
+        collar_der_metric = DiarizationErrorRate(collar = collar)
+        for i in range(batch_size):
+            annotation_pred = Annotation()
+            annotation_label = Annotation()
+            for j in range(num_output):
+                segments = self.get_segments(pred_np[i,:length[i],j])
+                for segment in segments:
+                    annotation_pred[segment, '_'] = j
+                segments = self.get_segments(label_np[i,:length[i],j])
+                for segment in segments:
+                    annotation_label[segment, '_'] = j
+            collar_der_metric(annotation_label, annotation_pred)
+            #breakpoint()
+        collar_der = abs(collar_der_metric)
+        return collar_der
+
+    @staticmethod
     def calc_diarization_error(pred, label, length):
         # Note (jiatong): Credit to https://github.com/hitachi-speech/EEND
-
         (batch_size, max_len, num_output) = label.size()
         # mask the padding part
         mask = np.zeros((batch_size, max_len, num_output))
@@ -337,6 +417,7 @@ class ESPnetDiarizationModel(AbsESPnetModel):
         speaker_error = float(np.sum(np.minimum(n_ref, n_sys) - n_map))
         correct = float(1.0 * np.sum((label_np == pred_np) * mask) / num_output)
         num_frames = np.sum(length)
+        #breakpoint()
         return (
             correct,
             num_frames,
